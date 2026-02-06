@@ -53,13 +53,6 @@ run_task() {
 export -f run_task
 
 # Determine number of cores
-if command -v nproc &> /dev/null; then
-    NPROCS=$(nproc)
-    NPROCS=$((NPROCS / 2))
-    [ "$NPROCS" -lt 1 ] && NPROCS=1
-else
-    NPROCS=2
-fi
-
+NPROCS=2
 ITEMS=({0..35})
 printf "%s\n" "${ITEMS[@]}" | xargs -P "$NPROCS" -I {} bash -c 'run_task "$@"' _ {}
