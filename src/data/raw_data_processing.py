@@ -24,9 +24,8 @@ def load_and_filter_col(path: str) -> pd.DataFrame:
     Returns:
         pandas.DataFrame: DataFrame containing only the selected relevant columns.
     """
-    df = pd.read_csv(path)
     relevant_columns = ['RELATION','DATDEP','PLANNED_DATE_ARR','PLANNED_DATE_DEP','REAL_DATE_ARR','REAL_DATE_DEP','TRAIN_NO','PLANNED_TIME_ARR','REAL_TIME_ARR','PLANNED_TIME_DEP','REAL_TIME_DEP','PTCAR_LG_NM_NL', 'PTCAR_NO', 'LINE_NO_DEP', 'LINE_NO_ARR']
-    df = df[relevant_columns]
+    df = pd.read_csv(path, usecols=relevant_columns)
     return df
 
 def concat_last_day_of_previous_month(df: pd.DataFrame, folder_path: str, year: int, month: int) -> pd.DataFrame:
@@ -358,26 +357,109 @@ def expand_and_add_actions_group(group: pd.DataFrame, deltat: int, idle_time_end
         return expanded_group, 0
     else:
         return pd.DataFrame(columns=expanded_group.columns), 2
-    
 
-def expand_and_add_actions(df: pd.DataFrame, deltat: int, idle_time_end: int) -> pd.DataFrame:
+
+def _month_state_time_bounds(current_year: int, current_month: int) -> tuple[int, int]:
+    reference_date = pd.Timestamp("2012-01-01")
+    start_date = pd.Timestamp(f"{current_year}-{current_month}-01 00:00:00")
+    last_day = calendar.monthrange(int(current_year), int(current_month))[1]
+    end_date = pd.Timestamp(f"{current_year}-{current_month}-{last_day} 23:59:59")
+    start_state_time = int((start_date - reference_date) / pd.Timedelta("1s"))
+    end_state_time = int((end_date - reference_date) / pd.Timedelta("1s"))
+    return start_state_time, end_state_time
+
+
+def _state_time_unique_order_like_concat(
+    df: pd.DataFrame, deltat: int, idle_time_end: int
+) -> list[int]:
+    """
+    Match ``pd.concat(expanded_groups)['STATE_TIME'].unique()`` order without
+    concatenating: first-seen order over groups (same GroupBy order) and row order.
+    """
+    ordered_unique: list[int] = []
+    seen: set[int] = set()
+    grouped = df.groupby(["TRAIN_NO", "DATDEP"])
+    for _, group in tqdm(grouped, desc="Pass 1: STATE_TIME catalog", leave=False):
+        result, _ = expand_and_add_actions_group(group, deltat, idle_time_end)
+        if result.empty:
+            continue
+        for t in result["STATE_TIME"].to_numpy():
+            ti = int(t)
+            if ti not in seen:
+                seen.add(ti)
+                ordered_unique.append(ti)
+        del result
+
+    return ordered_unique
+
+
+def expand_and_add_actions(
+    df: pd.DataFrame,
+    deltat: int,
+    idle_time_end: int,
+    *,
+    current_year: int | None = None,
+    current_month: int | None = None,
+    sample_ratio: float | None = None,
+) -> pd.DataFrame:
     """
     Expand all train groups to fixed time grids (1 row every deltat seconds) and add action labels.
+
+    When ``current_year``, ``current_month``, and ``sample_ratio`` are all given,
+    sampling matches :func:`filter_and_sample` (same unique ``STATE_TIME`` order,
+    same ``random.sample`` on in-month values) but only materializes rows for the
+    sampled times—much lower peak memory than expand-then-filter.
 
     Args:
         df (pandas.DataFrame): Input DataFrame containing train events grouped by TRAIN_NO and DATDEP.
         deltat (int): Time-step size in seconds for the expansion grid.
         idle_time_end (int): Minutes to extend beyond the last REAL_TIME_NUM when building the grid.
+        current_year (int, optional): Year for integrated month filter and subsampling.
+        current_month (int, optional): Month for integrated filter and subsampling.
+        sample_ratio (float, optional): Fraction of unique in-month state times to keep.
 
     Returns:
         pandas.DataFrame: Concatenated expanded groups with 'STATE_TIME' and 'action' columns.
     """
-    grouped = df.groupby(['TRAIN_NO', 'DATDEP'])
+    group_cols = ["TRAIN_NO", "DATDEP"]
+    use_integrated_sampling = (
+        current_year is not None and current_month is not None and sample_ratio is not None
+    )
 
-    codes = {'0': 0, '1': 0, '2': 0}
+    if use_integrated_sampling:
+        ordered_unique = _state_time_unique_order_like_concat(df, deltat, idle_time_end)
+        start_state_time, end_state_time = _month_state_time_bounds(current_year, current_month)
+        filtered_values = [v for v in ordered_unique if start_state_time <= v <= end_state_time]
+        num_samples = int(len(filtered_values) * sample_ratio)
+        sampled_times = random.sample(filtered_values, num_samples)
+
+        codes = {"0": 0, "1": 0, "2": 0}
+        new_rows: list[pd.DataFrame] = []
+        out_columns: pd.Index | None = None
+        grouped = df.groupby(group_cols)
+        pbar = tqdm(grouped, desc="Pass 2: Processing Groups")
+        for _, group in pbar:
+            result, code = expand_and_add_actions_group(group, deltat, idle_time_end)
+            codes[str(code)] += 1
+            pbar.set_postfix(codes)
+            if not result.empty:
+                if out_columns is None:
+                    out_columns = result.columns
+                result = result[result["STATE_TIME"].isin(sampled_times)]
+                if not result.empty:
+                    new_rows.append(result)
+            del result
+        pbar.close()
+        if not new_rows:
+            return pd.DataFrame(columns=out_columns) if out_columns is not None else pd.DataFrame()
+        return pd.concat(new_rows, ignore_index=True)
+
+    grouped = df.groupby(group_cols)
+
+    codes = {"0": 0, "1": 0, "2": 0}
     new_rows = []
 
-    pbar = tqdm(grouped, desc='Processing Groups')
+    pbar = tqdm(grouped, desc="Processing Groups")
     for _, group in pbar:
         result, code = expand_and_add_actions_group(group, deltat, idle_time_end)
         codes[str(code)] += 1
@@ -387,6 +469,7 @@ def expand_and_add_actions(df: pd.DataFrame, deltat: int, idle_time_end: int) ->
     pbar.close()
 
     return pd.concat(new_rows, ignore_index=True)
+
 
 def filter_and_sample(df: pd.DataFrame, current_year: int, current_month: int, sample_ratio: float) -> pd.DataFrame:
     """
@@ -402,13 +485,7 @@ def filter_and_sample(df: pd.DataFrame, current_year: int, current_month: int, s
         pandas.DataFrame: Subsampled DataFrame restricted to the given month.
     """
     possible_values = df.STATE_TIME.unique()
-    reference_date = pd.Timestamp("2012-01-01")
-    start_date = pd.Timestamp(f"{current_year}-{current_month}-01 00:00:00")
-    last_day = calendar.monthrange(int(current_year), int(current_month))[1]
-    end_date = pd.Timestamp(f"{current_year}-{current_month}-{last_day} 23:59:59")
-    
-    start_state_time = int((start_date - reference_date) / pd.Timedelta('1s'))
-    end_state_time = int((end_date - reference_date) / pd.Timedelta('1s'))
+    start_state_time, end_state_time = _month_state_time_bounds(current_year, current_month)
 
     # filter STATE_TIME rows not in the current month
     filtered_values = [v for v in possible_values if start_state_time <= v <= end_state_time]
@@ -544,8 +621,14 @@ def process_month(folder_path: str, year: int, month: int, deltat: int, nb_past_
     df = get_numerical_times(df, deltat)
     df = set_past_and_future_stations(df, nb_past_stations, nb_future_stations, idle_time_beggining, idle_time_end)
     df = convert_list_to_columns(df, nb_past_stations, nb_future_stations)
-    df = expand_and_add_actions(df, deltat, idle_time_end)
-    df = filter_and_sample(df, year, month, sample_ratio)
+    df = expand_and_add_actions(
+        df,
+        deltat,
+        idle_time_end,
+        current_year=year,
+        current_month=month,
+        sample_ratio=sample_ratio,
+    )
     df = convert_num_to_delta(df, nb_past_stations, nb_future_stations)
     df = create_time_features(df)
 
